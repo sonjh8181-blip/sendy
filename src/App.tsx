@@ -15,6 +15,7 @@ import { MirIdentificationCard } from './components/MirIdentificationCard';
 import { SAMPLE_TRANSCRIPTIONS } from './utils/sampleData';
 import { extractCleanNoteArrays } from './utils/musicXmlGenerator';
 import { pianoSynth } from './utils/audioPlayer';
+import { safeFetchJson } from './utils/safeApi';
 import { TranscriptionResult, SheetRowRecord } from './types/music';
 import {
   Sparkles,
@@ -24,13 +25,16 @@ import {
   Save,
   CheckCircle,
   AlertCircle,
+  AlertTriangle,
   Music2,
   ChevronRight,
   Disc3,
-  ExternalLink
+  ExternalLink,
+  X
 } from 'lucide-react';
 
 const GOOGLE_APPS_SCRIPT_URL =
+  import.meta.env.VITE_GAS_URL ||
   'https://script.google.com/macros/s/AKfycbwI8ikYRFtHIIg6IrMK_B54Ms4RLE1XebtxG6kC-VXRM-bz_siFmcPAWP7APO9Dc-O4/exec';
 
 export default function App() {
@@ -51,26 +55,58 @@ export default function App() {
   const [statusMessage, setStatusMessage] = useState('');
   const [isSavingToSheet, setIsSavingToSheet] = useState(false);
   const [isFetchingSheet, setIsFetchingSheet] = useState(false);
+  const [envWarning, setEnvWarning] = useState<string | null>(null);
   const [toastNotification, setToastNotification] = useState<{
     text: string;
     type: 'success' | 'info' | 'error';
   } | null>(null);
 
-  const showToast = (text: string, type: 'success' | 'info' | 'error' = 'info') => {
+  const showToast = useCallback((text: string, type: 'success' | 'info' | 'error' = 'info') => {
     setToastNotification({ text, type });
     setTimeout(() => {
       setToastNotification(null);
-    }, 4000);
-  };
+    }, 5000);
+  }, []);
 
-  // Fetch initial Google Sheets data on mount
+  // Check Environment Variables on mount
+  useEffect(() => {
+    const clientKey = import.meta.env.VITE_GEMINI_API_KEY;
+    const clientGasUrl = import.meta.env.VITE_GAS_URL;
+
+    // Probe server health and API key status
+    safeFetchJson<{ status: string; hasApiKey: boolean; gasUrl: string }>('/api/health')
+      .then((res) => {
+        if (!res.ok) {
+          // If server /api/health returned 404 or HTML error, notify user
+          const msg = `API 서버 연결 불가 (HTTP ${res.status}): Vercel 배포 시 vercel.json 또는 Environment Variables(GEMINI_API_KEY) 설정을 확인해 주세요.`;
+          setEnvWarning(msg);
+          showToast(msg, 'error');
+        } else if (res.data && !res.data.hasApiKey && !clientKey) {
+          const msg = 'GEMINI_API_KEY 환경변수가 설정되지 않았습니다. Vercel Project Settings > Environment Variables 또는 .env에 등록해 주세요.';
+          setEnvWarning(msg);
+          showToast(msg, 'error');
+        }
+      })
+      .catch(() => {
+        if (!clientKey) {
+          setEnvWarning('GEMINI_API_KEY 설정이 필요합니다. Vercel 대시보드에서 환경변수를 추가해 주세요.');
+        }
+      });
+  }, [showToast]);
+
+  // Fetch initial Google Sheets data on mount with defensive HTML handling
   const fetchSheetRecords = useCallback(async () => {
     setIsFetchingSheet(true);
     try {
-      const res = await fetch('/api/sheets/list');
-      const data = await res.json();
-      if (data.data && Array.isArray(data.data)) {
-        setSheetScores(data.data);
+      const res = await safeFetchJson<{ data: any[]; warning?: string }>('/api/sheets/list');
+      if (res.ok && res.data?.data && Array.isArray(res.data.data)) {
+        setSheetScores(res.data.data);
+        if (res.data.warning) {
+          console.warn('Sheets warning:', res.data.warning);
+        }
+      } else if (!res.ok) {
+        console.warn('Google Sheets list fetch failed:', res.error);
+        // Do not crash, UI uses fallback samples
       }
     } catch (err) {
       console.error('Failed to fetch sheet records:', err);
@@ -175,28 +211,28 @@ export default function App() {
     showToast(`"${score.title}" 악보가 로드되었습니다.`, 'info');
   };
 
-  // Text Transcription
+  // Text Transcription with safe fetch
   const handleTranscribeText = async (title: string, artist: string, promptHint?: string) => {
     setIsLoading(true);
     setStatusMessage('Gemini AI가 곡의 선율, 코드 진행 및 양손 피아노 악보를 채보하고 있습니다...');
     try {
-      const res = await fetch('/api/analyze-text', {
+      const res = await safeFetchJson<{ data: TranscriptionResult }>('/api/analyze-text', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title, artist, promptHint })
       });
 
-      const json = await res.json();
-      if (!res.ok || !json.success) {
-        throw new Error(json.error || '분석에 실패했습니다.');
+      if (!res.ok || !res.data?.data) {
+        throw new Error(res.error || '악보 채보 분석에 실패했습니다.');
       }
 
-      handleSwitchScore(json.data);
+      const score = res.data.data;
+      handleSwitchScore(score);
       setCurrentTab('player');
-      showToast(`"${json.data.title}" 악보 채보 완료!`, 'success');
+      showToast(`"${score.title}" 악보 채보 완료!`, 'success');
 
       // Auto-save to Google Sheet backend
-      saveToGoogleSheets(json.data);
+      saveToGoogleSheets(score);
     } catch (err: any) {
       showToast(err.message || '악보 분석 중 오류가 발생했습니다.', 'error');
     } finally {
@@ -205,7 +241,7 @@ export default function App() {
     }
   };
 
-  // Audio File/Mic Transcription
+  // Audio File/Mic Transcription with safe fetch
   const handleTranscribeAudio = async (
     audioBase64: string,
     mimeType: string,
@@ -215,23 +251,23 @@ export default function App() {
     setIsLoading(true);
     setStatusMessage('AI가 오디오 주파수 스펙트럼과 피아노 건반 계이름을 정밀 추출하고 있습니다...');
     try {
-      const res = await fetch('/api/analyze-audio', {
+      const res = await safeFetchJson<{ data: TranscriptionResult }>('/api/analyze-audio', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ audioBase64, mimeType, titleHint, artistHint })
       });
 
-      const json = await res.json();
-      if (!res.ok || !json.success) {
-        throw new Error(json.error || '음원 분석에 실패했습니다.');
+      if (!res.ok || !res.data?.data) {
+        throw new Error(res.error || '음원 분석에 실패했습니다.');
       }
 
-      handleSwitchScore(json.data);
+      const score = res.data.data;
+      handleSwitchScore(score);
       setCurrentTab('player');
-      showToast(`음원 악보 채보 완료: "${json.data.title}"`, 'success');
+      showToast(`음원 악보 채보 완료: "${score.title}"`, 'success');
 
       // Auto-save to Google Sheet backend
-      saveToGoogleSheets(json.data);
+      saveToGoogleSheets(score);
     } catch (err: any) {
       showToast(err.message || '음원 분석 중 오류가 발생했습니다.', 'error');
     } finally {
@@ -240,24 +276,26 @@ export default function App() {
     }
   };
 
-  // MIR Music Information Retrieval Search
+  // MIR Music Information Retrieval Search with safe fetch
   const handleMirSearch = async (query: string) => {
     setIsLoading(true);
     setStatusMessage('가사 및 음향 데이터를 정규화하여 MIR 식별 중입니다...');
     try {
-      const res = await fetch('/api/mir-identify', {
+      const res = await safeFetchJson<{ data: TranscriptionResult }>('/api/mir-identify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query })
       });
-      const json = await res.json();
-      if (!res.ok || !json.success) {
-        throw new Error(json.error || 'MIR 식별에 실패했습니다.');
+
+      if (!res.ok || !res.data?.data) {
+        throw new Error(res.error || 'MIR 식별에 실패했습니다.');
       }
-      handleSwitchScore(json.data);
+
+      const score = res.data.data;
+      handleSwitchScore(score);
       setCurrentTab('mir');
-      showToast(`MIR 식별 성공: ${json.data.title} - ${json.data.artist}`, 'success');
-      saveToGoogleSheets(json.data);
+      showToast(`MIR 식별 성공: ${score.title} - ${score.artist}`, 'success');
+      saveToGoogleSheets(score);
     } catch (err: any) {
       showToast(err.message || 'MIR 식별 중 오류가 발생했습니다.', 'error');
     } finally {
@@ -271,19 +309,22 @@ export default function App() {
     showToast('MIR 식별 결과가 초기화되었습니다.', 'info');
   };
 
-  // Save to Google Sheets
+  // Save to Google Sheets with defensive handling
   const saveToGoogleSheets = async (scoreToSave = currentScore) => {
     if (!scoreToSave) return;
     setIsSavingToSheet(true);
     try {
-      const res = await fetch('/api/sheets/save', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(scoreToSave)
-      });
-      const json = await res.json();
-      if (!res.ok || !json.success) {
-        throw new Error(json.error || 'Google Sheets 저장 실패');
+      const res = await safeFetchJson<{ message?: string; googleSheetResponse?: any }>(
+        '/api/sheets/save',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(scoreToSave)
+        }
+      );
+
+      if (!res.ok) {
+        throw new Error(res.error || 'Google Sheets 저장에 실패했습니다.');
       }
 
       showToast('Google Sheets 데이터베이스에 악보가 안전하게 저장되었습니다!', 'success');
@@ -297,8 +338,7 @@ export default function App() {
 
   // Load from Sheets table
   const handleSelectScoreFromSheet = async (scoreId: string) => {
-    // Check presets first
-    const preset = SAMPLE_TRANSCRIPTIONS.find(s => s.id === scoreId);
+    const preset = SAMPLE_TRANSCRIPTIONS.find((s) => s.id === scoreId);
     if (preset) {
       handleSwitchScore(preset);
       setCurrentTab('player');
@@ -306,21 +346,17 @@ export default function App() {
     }
 
     try {
-      const res = await fetch(`/api/scores/${scoreId}`);
-      if (res.ok) {
-        const json = await res.json();
-        if (json.data) {
-          handleSwitchScore(json.data);
-          setCurrentTab('player');
-          return;
-        }
+      const res = await safeFetchJson<{ data: TranscriptionResult }>(`/api/scores/${scoreId}`);
+      if (res.ok && res.data?.data) {
+        handleSwitchScore(res.data.data);
+        setCurrentTab('player');
+        return;
       }
     } catch {
-      // ignore
+      // fallback below
     }
 
-    // Fallback from row record
-    const row = sheetScores.find(s => s.id === scoreId);
+    const row = sheetScores.find((s) => s.id === scoreId);
     if (row) {
       const constructedScore: TranscriptionResult = {
         id: row.id,
@@ -333,7 +369,12 @@ export default function App() {
         sheetData: row.sheetData,
         hands: {
           rightHandMelody: ['G4', 'Bb4', 'Eb5', 'D5', 'C5', 'Bb4', 'G4', 'F4'],
-          leftHandChords: [['Eb3', 'Bb3', 'Eb4'], ['C3', 'G3', 'C4'], ['Ab2', 'Eb3', 'Ab3'], ['Bb2', 'F3', 'Bb3']]
+          leftHandChords: [
+            ['Eb3', 'Bb3', 'Eb4'],
+            ['C3', 'G3', 'C4'],
+            ['Ab2', 'Eb3', 'Ab3'],
+            ['Bb2', 'F3', 'Bb3']
+          ]
         },
         createdAt: row.createdAt
       };
@@ -346,9 +387,39 @@ export default function App() {
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-amber-500/30 selection:text-amber-200">
       {/* Toast Notification */}
       {toastNotification && (
-        <div className="fixed bottom-6 right-6 z-50 flex items-center gap-2.5 px-4 py-3 rounded-2xl shadow-2xl backdrop-blur-md border animate-bounce text-xs font-semibold bg-slate-900/95 border-amber-500/40 text-amber-200">
-          <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
+        <div
+          className={`fixed bottom-6 right-6 z-50 flex items-center gap-2.5 px-4 py-3 rounded-2xl shadow-2xl backdrop-blur-md border animate-bounce text-xs font-semibold ${
+            toastNotification.type === 'error'
+              ? 'bg-rose-950/95 border-rose-500/50 text-rose-200'
+              : toastNotification.type === 'success'
+              ? 'bg-emerald-950/95 border-emerald-500/50 text-emerald-200'
+              : 'bg-slate-900/95 border-amber-500/40 text-amber-200'
+          }`}
+        >
+          {toastNotification.type === 'error' ? (
+            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+          ) : toastNotification.type === 'success' ? (
+            <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
+          ) : (
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+          )}
           <span>{toastNotification.text}</span>
+        </div>
+      )}
+
+      {/* Environment Variable Warning Banner if missing */}
+      {envWarning && (
+        <div className="bg-amber-950/90 border-b border-amber-500/40 px-4 py-2 text-xs text-amber-200 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2 overflow-hidden">
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+            <span className="truncate font-medium">{envWarning}</span>
+          </div>
+          <button
+            onClick={() => setEnvWarning(null)}
+            className="text-amber-400 hover:text-white p-1 rounded transition-colors shrink-0"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
         </div>
       )}
 
@@ -403,7 +474,6 @@ export default function App() {
         {/* Tab 1: Piano Player & Grand Staff Visualizer */}
         {currentTab === 'player' && (
           <div className="space-y-6">
-            {/* Playback Transport Controller */}
             <PlaybackController
               score={currentScore}
               isPlaying={isPlaying}
@@ -419,14 +489,12 @@ export default function App() {
               onToggleMetronome={handleToggleMetronome}
             />
 
-            {/* Interactive 5-line Grand Staff Viewer */}
             <GrandStaffViewer
               score={currentScore}
               currentStep={currentStep}
               isPlaying={isPlaying}
             />
 
-            {/* Interactive 49-Key Piano Keyboard */}
             <PianoVisualizer
               activeRightNotes={activeRightNotes}
               activeLeftNotes={activeLeftNotes}
@@ -477,7 +545,7 @@ export default function App() {
           </div>
         )}
 
-        {/* Tab 3: MIR Identification Results (User Reference Design) */}
+        {/* Tab 3: MIR Identification Results */}
         {currentTab === 'mir' && (
           <div className="space-y-6">
             <MirIdentificationCard
@@ -504,7 +572,7 @@ export default function App() {
           />
         )}
 
-        {/* Tab 4: AI Music Analysis Report & JSON / XML */}
+        {/* Tab 5: AI Music Analysis Report & JSON / XML */}
         {currentTab === 'report' && (
           <MusicAnalysisReport score={currentScore} />
         )}
